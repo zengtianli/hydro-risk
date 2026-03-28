@@ -49,8 +49,7 @@ from pathlib import Path
 
 # 导入公共工具模块
 SCRIPT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = SCRIPT_DIR.parent.parent  # .assets 目录
-sys.path.insert(0, str(ASSETS_DIR / "lib"))
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
 
 from hydraulic import (
     normalize_code,
