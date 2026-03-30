@@ -9,7 +9,7 @@
 
 ---
 
-![hydro-risk demo](docs/screenshots/demo.svg)
+![hydro-risk demo](docs/screenshots/demo.png)
 
 ---
 
