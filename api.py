@@ -5,6 +5,10 @@ Three-phase ETL pipeline exposed as three independent endpoints:
     POST /api/compute/phase2   # forecast_sx.xlsx  (2.1)
     POST /api/compute/phase3   # risk_sx.xlsx      (3.01-3.09)
 
+Each endpoint accepts a `format` Form field:
+    - "xlsx" (default): return xlsx blob via Content-Disposition header
+    - "json": return JSON payload with scripts status + per-sheet previews + xlsxBase64
+
 Design notes:
 - Phase 1/2 scripts hard-code relative paths (input/*, output/*.xlsx) and have
   NO argparse — we must materialize an isolated workdir matching those paths
@@ -25,15 +29,20 @@ Run:
 """
 from __future__ import annotations
 
+import base64
+import io
+import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -61,6 +70,9 @@ app.add_middleware(
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# 结果表截断阈值 — 单 sheet 超过这个行数，前端只展示前 N 行（xlsx 完整保留）
+JSON_ROW_LIMIT = 500
+
 
 # ─────────────────────── diagnostics ───────────────────────
 
@@ -78,9 +90,9 @@ def meta_info() -> dict:
         "description": "风险图数据表自动填充（GeoJSON→Excel三阶段ETL）",
         "version": "1.0.0",
         "phases": {
-            "phase1": [x[0] for x in PHASE_1],
-            "phase2": [x[0] for x in PHASE_2],
-            "phase3": [x[0] for x in PHASE_3],
+            "phase1": [{"id": x[0], "label": x[2]} for x in PHASE_1],
+            "phase2": [{"id": x[0], "label": x[2]} for x in PHASE_2],
+            "phase3": [{"id": x[0], "label": x[2]} for x in PHASE_3],
         },
     }
 
@@ -105,6 +117,46 @@ def _parse_selected(selected: str | None, default: list) -> list:
         return default
     wanted = {s.strip() for s in selected.split(",") if s.strip()}
     return [row for row in default if row[0] in wanted]
+
+
+def _df_to_json_safe(df: pd.DataFrame, limit: int | None = None) -> dict:
+    """DataFrame → {columns, rows, totalRows}. Handles NaN / datetime / numpy types."""
+    total = len(df)
+    sliced = df.head(limit) if limit is not None and total > limit else df
+    parsed = json.loads(sliced.to_json(orient="split", date_format="iso", force_ascii=False))
+    return {"columns": parsed["columns"], "rows": parsed["data"], "totalRows": total}
+
+
+def _xlsx_to_results_payload(xlsx_path: Path, limit: int | None = JSON_ROW_LIMIT) -> dict:
+    """Read every sheet of an xlsx → {sheet_name: {columns, rows, totalRows}}."""
+    if not xlsx_path.exists():
+        return {}
+    xlsx = pd.ExcelFile(xlsx_path)
+    out: dict[str, dict] = {}
+    for sheet in xlsx.sheet_names:
+        try:
+            df = xlsx.parse(sheet)
+        except Exception as e:  # noqa: BLE001
+            out[sheet] = {"columns": ["error"], "rows": [[f"{type(e).__name__}: {e}"]], "totalRows": 0}
+            continue
+        out[sheet] = _df_to_json_safe(df, limit=limit)
+    return out
+
+
+def _scripts_payload(
+    logs: list[tuple[str, str, bool, str, str]],
+) -> list[dict]:
+    """logs entry = (num, name, ok, stdout, stderr)"""
+    return [
+        {
+            "id": num,
+            "name": name,
+            "status": "ok" if ok else "fail",
+            "stdout": (out or "")[-2000:],
+            "stderr": (err or "")[-2000:],
+        }
+        for (num, name, ok, out, err) in logs
+    ]
 
 
 def _xlsx_response(
@@ -139,6 +191,31 @@ def _xlsx_response(
     )
 
 
+def _json_response(
+    phase: int,
+    result_key: str,
+    xlsx_path: Path,
+    logs: list[tuple[str, str, bool, str, str]],
+    elapsed_ms: int,
+) -> JSONResponse:
+    """Build the rich JSON payload mirroring hydro-capacity's contract."""
+    xlsx_bytes = xlsx_path.read_bytes() if xlsx_path.exists() else b""
+    results_map = _xlsx_to_results_payload(xlsx_path) if xlsx_bytes else {}
+    payload = {
+        "phase": phase,
+        "meta": {
+            "phase": phase,
+            "scripts": _scripts_payload(logs),
+            "elapsedMs": elapsed_ms,
+            "xlsxBytes": len(xlsx_bytes),
+        },
+        # 按 phase 归属的主结果键名（方便前端走固定 key，但仍带 sheet 级拆分）
+        "results": {result_key: results_map},
+        "xlsxBase64": base64.b64encode(xlsx_bytes).decode("ascii") if xlsx_bytes else "",
+    }
+    return JSONResponse(content=payload)
+
+
 # ─────────────────────── Phase 1 ───────────────────────
 
 @app.post("/api/compute/phase1")
@@ -155,12 +232,14 @@ async def compute_phase1(
     selected: Optional[str] = Form(
         None, description="逗号分隔的脚本 id，如 '1.1,1.2'；留空=全跑"
     ),
+    format: str = Form("xlsx", description="xlsx (binary) | json (scripts+results+base64)"),
 ) -> Response:
     """Phase 1: 数据库建设 (1.1-1.4) → datebase_sx.xlsx."""
     scripts = _parse_selected(selected, PHASE_1)
     if not scripts:
         raise HTTPException(400, "selected 未匹配任何 Phase 1 脚本")
 
+    started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="hydro_risk_p1_") as tmp:
         workdir = Path(tmp)
         input_dir = workdir / "input"
@@ -184,6 +263,9 @@ async def compute_phase1(
             ok, out, err = run_script(fname, args=None, work_dir=str(workdir))
             logs.append((num, label, ok, out, err))
 
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if format == "json":
+            return _json_response(1, "database_sx", target, logs, elapsed_ms)
         return _xlsx_response(target, "database_sx.xlsx", logs)
 
 
@@ -198,12 +280,14 @@ async def compute_phase2(
         None, description="断面里程 GeoJSON（映射到 input/dm_lc_ll.geojson）"
     ),
     selected: Optional[str] = Form(None),
+    format: str = Form("xlsx", description="xlsx (binary) | json (scripts+results+base64)"),
 ) -> Response:
     """Phase 2: 预报断面 (2.1) → forecast_sx.xlsx."""
     scripts = _parse_selected(selected, PHASE_2)
     if not scripts:
         raise HTTPException(400, "selected 未匹配任何 Phase 2 脚本")
 
+    started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="hydro_risk_p2_") as tmp:
         workdir = Path(tmp)
         input_dir = workdir / "input"
@@ -221,6 +305,9 @@ async def compute_phase2(
             ok, out, err = run_script(fname, args=None, work_dir=str(workdir))
             logs.append((num, label, ok, out, err))
 
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if format == "json":
+            return _json_response(2, "forecast_sx", target, logs, elapsed_ms)
         return _xlsx_response(target, "forecast_sx.xlsx", logs)
 
 
@@ -241,12 +328,14 @@ async def compute_phase3(
     csv_gdp: Optional[UploadFile] = File(None, description="GDP/人口 CSV (3.01/3.02)"),
     csv_region: Optional[UploadFile] = File(None, description="region_name_code.csv"),
     selected: Optional[str] = Form(None),
+    format: str = Form("xlsx", description="xlsx (binary) | json (scripts+results+base64)"),
 ) -> Response:
     """Phase 3: 风险分析 (3.01-3.09) → risk_sx.xlsx."""
     scripts = _parse_selected(selected, PHASE_3)
     if not scripts:
         raise HTTPException(400, "selected 未匹配任何 Phase 3 脚本")
 
+    started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="hydro_risk_p3_") as tmp:
         workdir = Path(tmp)
         input_dir = workdir / "input"
@@ -306,4 +395,7 @@ async def compute_phase3(
             ok, out, err = run_script(fname, args=_args_for(num), work_dir=str(workdir))
             logs.append((num, label, ok, out, err))
 
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if format == "json":
+            return _json_response(3, "risk_sx", target, logs, elapsed_ms)
         return _xlsx_response(target, "risk_sx.xlsx", logs)
