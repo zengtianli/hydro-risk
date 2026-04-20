@@ -31,18 +31,27 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+
+# --- shared helpers (see ~/Dev/devtools/lib/hydro_api_helpers.py) ---
+for _p in [Path.home() / "Dev/devtools/lib", Path("/var/www/devtools/lib")]:
+    if _p.exists():
+        sys.path.insert(0, str(_p))
+        break
+from hydro_api_helpers import (  # noqa: E402
+    cjk_header_safe,
+    cors_origins,
+    df_to_json_safe,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -59,11 +68,7 @@ app = FastAPI(title="hydro-risk-api", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3119",
-        "http://127.0.0.1:3119",
-        "https://hydro-risk.tianlizeng.cloud",
-    ],
+    allow_origins=cors_origins("hydro-risk", 3119),
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -119,14 +124,6 @@ def _parse_selected(selected: str | None, default: list) -> list:
     return [row for row in default if row[0] in wanted]
 
 
-def _df_to_json_safe(df: pd.DataFrame, limit: int | None = None) -> dict:
-    """DataFrame → {columns, rows, totalRows}. Handles NaN / datetime / numpy types."""
-    total = len(df)
-    sliced = df.head(limit) if limit is not None and total > limit else df
-    parsed = json.loads(sliced.to_json(orient="split", date_format="iso", force_ascii=False))
-    return {"columns": parsed["columns"], "rows": parsed["data"], "totalRows": total}
-
-
 def _xlsx_to_results_payload(xlsx_path: Path, limit: int | None = JSON_ROW_LIMIT) -> dict:
     """Read every sheet of an xlsx → {sheet_name: {columns, rows, totalRows}}."""
     if not xlsx_path.exists():
@@ -139,7 +136,7 @@ def _xlsx_to_results_payload(xlsx_path: Path, limit: int | None = JSON_ROW_LIMIT
         except Exception as e:  # noqa: BLE001
             out[sheet] = {"columns": ["error"], "rows": [[f"{type(e).__name__}: {e}"]], "totalRows": 0}
             continue
-        out[sheet] = _df_to_json_safe(df, limit=limit)
+        out[sheet] = df_to_json_safe(df, limit=limit)
     return out
 
 
@@ -184,7 +181,7 @@ def _xlsx_response(
         media_type=XLSX_MIME,
         headers={
             "Content-Disposition": f'attachment; filename="{download_name}"',
-            "X-Scripts-Status": quote(status_line),
+            "X-Scripts-Status": cjk_header_safe(status_line),
             "Access-Control-Expose-Headers":
                 "X-Scripts-Status, Content-Disposition",
         },
